@@ -1,0 +1,393 @@
+// 9/23/2015 - Modified for Moteino use by John Wills 
+// 10/28/2015 - modified measuring routine
+
+/*
+ * Credits:
+ * Most of the power measurement and calculations were invented by Trystan Lea and documented at
+ * http://openenergymonitor.org/.  I modified it for the split phase 240 in residential use in the U.S.
+ * I'm using a ladyada boot rom (purchased directly from her site) to overcome unexpected problems
+ * and multiple vulnerable arduinos.  A lot of the remaining code was taken from example sketches
+ * supplied by the Arduino site www.arduino.cc
+ * Basic energy monitoring sketch plus kwh and frequency calc - by Trystan Lea
+ * Licenced under GNU General Public Licence more details here
+ * openenergymonitor.org
+ *
+ * Open source rules!
+ * Pin usage:
+ *   Analog 5 current sensor - I'm not using this at the moment
+ *   Analog 4 voltage sensor
+ */
+
+//Sketch measures voltage and current.
+//and then calculates useful values like real power,
+//apparent power, powerfactor, Vrms, Irms, frequency and kwh.
+
+#include <RFM69.h>         //get it here: http://github.com/lowpowerlab/rfm69
+#include <SPIFlash.h>      //get it here: http://github.com/lowpowerlab/spiflash
+#include <WirelessHEX69.h> //get it here: https://github.com/LowPowerLab/WirelessProgramming
+#include <SPI.h>           //comes with Arduino IDE (www.arduino.cc)
+
+//#include <avr/wdt.h>
+//#include <MemoryFree.h>
+//#include <avr/pgmspace.h>
+//#include <SoftwareSerial.h>
+//#include <Time.h>
+//#include <TimeAlarms.h>
+//#include <XBee.h>
+
+//*****************************************************************************************************************************
+// ADJUST THE SETTINGS BELOW DEPENDING ON YOUR HARDWARE/TRANSCEIVER SETTINGS/REQUIREMENTS
+//*****************************************************************************************************************************
+#define GATEWAYID   1
+#define NODEID      48
+#define NETWORKID   101
+//#define FREQUENCY     RF69_433MHZ
+//#define FREQUENCY     RF69_868MHZ
+#define FREQUENCY       RF69_915MHZ //Match this with the version of your Moteino! (others: RF69_433MHZ, RF69_868MHZ)
+#define ENCRYPTKEY      "0000000000000000" //has to be same 16 characters/bytes on all nodes, not more not less!
+#define IS_RFM69HW      //uncomment only for RFM69HW! Leave out if you have RFM69W!
+#define SERIAL_EN                //comment out if you don't want any serial output
+#define LED         9   //pin connected to onboard LED
+
+#ifdef SERIAL_EN
+  #define SERIAL_BAUD   115200
+  #define DEBUG(input)   {Serial.print(input); delay(1);}
+  #define DEBUGln(input) {Serial.println(input); delay(1);}
+#else
+  #define DEBUG(input);
+  #define DEBUGln(input);
+  #define SERIALFLUSH();
+#endif
+
+const long interval = 10000;           // interval at which to check voltage 300000 is 5 minutes, we're using 10,000 which = every 10 seconds for sending updates to the gateway
+unsigned long previousMillis = 0;        // will store last time voltage sensor was read
+
+RFM69 radio;
+char Pstr[10];
+char sendBuf[30];
+SPIFlash flash(8, 0xEF30); //WINDBOND 4MBIT flash chip on CS pin D8 (default for Moteino)
+
+char Dbuf[100];   // general purpose buffer
+//Setup variables
+int numberOfSamples = 3000;
+
+//John set these up for alerts called "deltaAlert"
+int Delta, lastVoltage;
+boolean deltaAlert;
+
+//Set Voltage and current input pins
+int inPinV = 4;
+int inPinI = 5;
+
+//Calibration coeficients
+double VCAL = 2.513;
+double ICAL = 03.2;
+double PHASECAL = 0.1;
+
+//Sample variables
+int lastSampleV,lastSampleI,sampleV,sampleI;
+
+//Filter variables
+double lastFilteredV, lastFilteredI, filteredV, filteredI = 0;
+double filterTemp;
+
+//Stores the phase calibrated instantaneous voltage.
+double calibratedV;
+
+//Power calculation variables
+double sqI,sqV,instP,sumI,sumV,sumP;
+
+//Useful value variables
+double realPower,
+       apparentPower,
+       powerFactor,
+       Vrms,
+       Irms;
+
+  //--ENERGY MEASURMENT VARIABLES------------------------------
+    //Calculation of kwh
+
+    //time taken since last measurment timems = tmillis - ltmillis;
+    unsigned long ltmillis, tmillis, timems;
+    //time when arduino is switched on... is it 0?
+    unsigned long startmillis;
+   
+  //--FREQUENCY MEASURMENT VARIABLES--------------------------- 
+    //time in microseconds when the voltage waveform
+    //last crossed zero.
+    unsigned long vLastZeroMsec;
+    //Micro seconds since last zero-crossing
+    unsigned long vPeriod;
+    //Sum of vPeriod's to obtain an average.
+    unsigned long vPeriodSum;
+    //Number of periods summed
+    unsigned long vPeriodCount;
+   
+    //Frequency
+    float freq;
+   
+    //Used to filter out fringe vPeriod readings.
+    //Configured for 50Hz
+    //- If your 60Hz set expPeriod = 16666
+    unsigned long expPeriod = 16666;
+    unsigned long filterWidth = 2000;
+  //-----------------------------------------------------------
+
+/* Measurement calculations */ 
+
+void PwrCalcs()
+{
+  for (int n=0; n<numberOfSamples; n++) // gather samples
+  {
+     //Used for offset removal
+     lastSampleV=sampleV;
+     lastSampleI=sampleI;
+     //Read in voltage and current samples.  
+     sampleV = analogRead(inPinV);
+     sampleI = analogRead(inPinI);
+
+     //Used for offset removal
+     lastFilteredV = filteredV;
+     lastFilteredI = filteredI;
+ 
+     //Digital high pass filters to remove 2.5V DC offset.
+     filteredV = 0.996 * (lastFilteredV+sampleV-lastSampleV);
+     filteredI = 0.996 * (lastFilteredI+sampleI-lastSampleI);
+
+     //Phase calibration goes here.
+     calibratedV = lastFilteredV + PHASECAL * (filteredV - lastFilteredV);
+ 
+     //Root-mean-square method voltage
+     //1) square voltage values
+     sqV= calibratedV * calibratedV;
+     //2) sum
+     sumV += sqV;
+  
+     //Root-mean-square method current
+     //1) square current values
+     sqI = filteredI * filteredI;
+     //2) sum
+     sumI += sqI;
+
+     //Instantaneous Power
+     instP = abs(calibratedV * filteredI);
+     //Sum
+     sumP += instP;
+  
+     //--FREQUENCY MEASURMENT---------------------------          
+     if (n==0) vLastZeroMsec = micros();
+  
+     //Check for zero crossing from less than zero to more than zero
+     if (lastFilteredV < 0 && filteredV >= 0 && n>1)
+     {
+       //period of voltage waveform
+       vPeriod = micros() - vLastZeroMsec;
+
+       //Filteres out any erronous period measurments
+       //Increases accuracy considerably
+       if (vPeriod > (expPeriod-filterWidth) && vPeriod<(expPeriod+filterWidth))
+       {
+          vPeriodSum += vPeriod;
+          vPeriodCount++;
+       }
+       vLastZeroMsec = micros();
+     }
+  } //end of sample gathering
+
+  //Calculation of the root of the mean of the voltage and current squared (rms)
+  //Calibration coeficients applied.
+  Vrms = VCAL*sqrt(sumV / numberOfSamples);
+  Irms = ICAL*sqrt(sumI / numberOfSamples);
+
+  //Calculation power values
+  realPower = VCAL*ICAL*sumP / numberOfSamples;
+  apparentPower = Vrms * Irms;
+  powerFactor = realPower / apparentPower;
+
+  //FREQUENCY CALCULATION--------------------------
+  freq = (1000000.0 * vPeriodCount) / vPeriodSum;
+     
+  vPeriodSum=0;
+  vPeriodCount=0;
+  //------------------------------------------------
+
+  //--ENERGY MEASURMENT CALCULATION----------------    
+       
+  //Calculate amount of time since last realpower measurment.
+  ltmillis = tmillis;
+  tmillis = millis();
+  timems = tmillis - ltmillis;
+     
+  //Reset accumulators
+  sumV = 0;
+  sumI = 0;
+  sumP = 0;
+}
+
+// this function outputs the current free memory to the serial port
+// really nice to use in debugging and making sure the board doesn't
+// fail running out of memory
+/*
+void showMem(){
+  strcpy_P(Dbuf,PSTR("Mem = "));
+  Serial.print(Dbuf);
+  Serial.println(freeMemory());
+}
+*/
+
+// this set of functions are for a software reset of the board
+// the reset function allows a call to location zero which will emulate a reset
+// the resetMe funtion allows a normal call from the timer routines
+void(* resetFunc) (void) = 0; //declare reset function @ address 0
+
+/*
+void resetMe(){  // for periodic resets to be sure nothing clogs it up
+  Serial.println("Periodic Reset - Normal Operation");
+  resetFunc();
+}
+*/
+
+// this little function will return the first two digits after the decimal
+// point of a float as an int to help with sprintf() (won't work for negative values)
+int frac(float num){
+  return( (num - (int)num) * 100);
+}
+
+// report the power usage over XBee network and out the Serial Port
+void reportPower(){ 
+  memset(Dbuf,0,sizeof(Dbuf));
+  Serial.print("Broadcast--");
+  // first construct the payload line
+  sprintf(Dbuf,"Power,%d.%1d,%d.%1d,%d.%1d,%d.%1d,%d.%1d,%d.%1d\r",
+       (int)realPower, frac(realPower),
+       (int)apparentPower, frac(apparentPower),
+       (int)powerFactor, frac(powerFactor),
+       (int)Vrms, frac(Vrms),
+       (int)Irms, frac(Irms),
+       (int)freq, frac(freq));
+  // Display it on the serial monitor for debugging
+//  Serial.print(Dbuf);
+//  Serial.print("\n");
+
+}
+
+void setup()
+{
+#ifdef SERIAL_EN
+  Serial.begin(SERIAL_BAUD);
+#endif
+
+  //--ENERGY MEASURMENT SETUP--------------------------------
+  tmillis = millis();
+  startmillis=tmillis;
+  //---------------------------------------------------------
+/*
+  Serial.println("I'm alive ");
+  Serial.println("Setting timer for reporting");
+  /* I really don't care what time it is on this device
+     it just measure time and reports.  But, I want the timer capability
+     to allow a reset every 24 hours and to handle the reporting function
+     so I just set the time to something reasonable and get on with the
+     rest of the work.
+  
+  setTime(0,0,0,1,1,12);
+  Alarm.timerRepeat(5, reportPower);   // report the power usage every 5 seconds
+  Alarm.alarmRepeat(23,59,0,resetMe);  // periodic reset to keep things cleaned up
+                                       // I use a lot of libraries and sometimes they have bugs
+                                       // as well as hang ups from various hardware devices
+  showMem();                           // to make sure I don't make it too big to fit in ram reliably
+  pinMode(6,OUTPUT);
+  digitalWrite(6,LOW);
+  Serial.println("Init done");
+  wdt_enable(WDTO_8S);          // No more than 8 seconds of inactivity
+  */ 
+
+  radio.initialize(FREQUENCY,NODEID,NETWORKID);
+  
+#ifdef IS_RFM69HW
+  radio.setHighPower(); //uncomment only for RFM69HW!
+#endif
+  radio.encrypt(ENCRYPTKEY);
+  char buff[50];
+  sprintf(buff, "\nACvoltageMote : %d Mhz...", FREQUENCY==RF69_433MHZ ? 433 : FREQUENCY==RF69_868MHZ ? 868 : 915);
+  DEBUGln(buff);
+
+  if (flash.initialize())
+  {
+    Serial.print("SPI Flash Init OK ... UniqueID (MAC): ");
+    flash.readUniqueId();
+    for (byte i=0;i<8;i++)
+    {
+      Serial.print(flash.UNIQUEID[i], HEX);
+      Serial.print(' ');
+    }
+    Serial.println();
+  }
+  else
+    Serial.println("SPI Flash Init FAIL! (is chip present?)");
+
+}
+
+/*
+  The loop() just calculates power over and over again.  There is a timer
+  set in setup() that causes the device to report every few seconds.
+  The loop() also resets the watchdog timer so it doesn't time out.
+*/
+void loop()
+{
+
+// get power calcs into variables
+PwrCalcs();
+
+Delta = (int)Vrms - lastVoltage;
+Delta = abs(Delta);  // make it the absolute value so we detect power drop/ off and power on events
+
+if (Delta > 10)
+  deltaAlert = true;
+else 
+  deltaAlert = false;
+
+
+unsigned long currentMillis = millis();
+
+  if ((currentMillis - previousMillis >= interval) || (deltaAlert == true) || ((int)Vrms > 105 && lastVoltage < 105)) {  // replace the delta alert code with ((int)Vrms) < 105) once I figure out the metrics.js code
+    previousMillis = currentMillis;
+
+    char buff[15];  //was 10 in original code
+    sprintf(buff,"VAC:%d.%d",   
+       (int)Vrms, frac(Vrms));  // used to have a \r carriage return after the 02d in the line above
+    byte len = strlen(buff);
+    radio.sendWithRetry(GATEWAYID, buff, len);
+
+    // now flash the onboard LED to show we sent data on the RFM69
+    digitalWrite(LED, HIGH);
+    delay(300);
+    digitalWrite(LED, LOW);
+
+    //first send any ACK to request
+    DEBUG(buff);
+
+    if (radio.ACKRequested())
+    {
+      radio.sendACK();
+      DEBUG(" - ACK sent.");
+    }
+    DEBUGln();
+    delay(4000);  // wait 4 seconds minimum before we enter this loop possibly again
+    lastVoltage = (int)Vrms;
+  }
+  else {
+    lastVoltage = (int)Vrms;
+//  deltaAlert = false;
+  }
+  
+//  wdt_reset();                   // watchdog timer set back to zero
+//  Alarm.delay(0);                // This causes the alarm timer to update
+
+// wireless programming token check
+// DO NOT REMOVE, or GarageMote will not be wirelessly programmable any more!
+CheckForWirelessHEX(radio, flash, true);
+
+}
+
+  
