@@ -620,6 +620,13 @@ exports.tstatPoll = function(nodeId) {
   });
 }
 
+// Remember for the function below to work, it REQUIRES installing an ubidots package on your Raspberry Pi!!! 
+// VERY IMPORTANT!!
+// Setup a puTTY session and then on the Pi do these things
+// sudo apt-get install python-setuptools
+// sudo easy_install pip
+// npm install ubidots
+// then, reboot your pi after the above comands are done. 
 
 exports.getMetricValue = function(node, ubiVolts) { 
 var ubidots = require('ubidots');
